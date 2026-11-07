@@ -1,0 +1,69 @@
+# Lab 8: деплой за git-тегом v* (git tag v1.0.0 && git push origin v1.0.0).
+# 1) збирає образ, перевіряє його і публікує в GHCR: ghcr.io/<owner>/<repo>:<тег> і :latest;
+# 2) просить хостинг (Render) розгорнути саме цей образ;
+# 3) чекає, поки публічний /health покаже SHA коміту, на який вказує тег.
+#
+# Налаштування репозиторію (Settings → Secrets and variables → Actions):
+#   secret   RENDER_DEPLOY_HOOK — Deploy Hook сервісу Render (https://api.render.com/deploy/srv-…?key=…)
+#   variable PUBLIC_URL         — адреса гри, напр. https://spacefight.onrender.com
+name: Deploy
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.name.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: name
+        # імена в GHCR лише малими літерами
+        run: echo "image=ghcr.io/${GITHUB_REPOSITORY,,}:${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+      - run: docker build -t "${{ steps.name.outputs.image }}" --build-arg GIT_SHA=${{ github.sha }} --build-arg APP_VERSION=${{ github.ref_name }} .
+      - run: sh scripts/docker-check.sh "${{ steps.name.outputs.image }}"
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - run: |
+          docker push "${{ steps.name.outputs.image }}"
+          latest="${{ steps.name.outputs.image }}"; latest="${latest%:*}:latest"
+          docker tag "${{ steps.name.outputs.image }}" "$latest" && docker push "$latest"
+
+  deploy:
+    needs: image
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Render — розгорнути образ з GHCR
+        env:
+          HOOK: ${{ secrets.RENDER_DEPLOY_HOOK }}
+          IMAGE: ${{ needs.image.outputs.image }}
+        run: |
+          test -n "$HOOK" || { echo "RENDER_DEPLOY_HOOK не задано"; exit 1; }
+          curl -fsS -X POST "$HOOK&imgURL=$(printf %s "$IMAGE" | jq -sRr @uri)"
+      - name: /health показує SHA цього тегу
+        env:
+          URL: ${{ vars.PUBLIC_URL }}
+        run: |
+          for i in $(seq 1 60); do
+            sha=$(curl -fsS "$URL/health" | jq -r .sha || true)
+            echo "спроба $i: $sha"
+            [ "$sha" = "${{ github.sha }}" ] && exit 0
+            sleep 10
+          done
+          echo "за 10 хв нова версія не з'явилась"; exit 1
+      - name: WebSocket — лише wss://
+        env:
+          URL: ${{ vars.PUBLIC_URL }}
+        run: |
+          case "$URL" in https://*) ;; *) echo "PUBLIC_URL має бути https:// — тоді клієнт відкриває wss://"; exit 1 ;; esac
+          curl -fsS "$URL/ready"
